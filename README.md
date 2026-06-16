@@ -296,7 +296,6 @@ checkpoints/
 *.pth
 datazoo/
 modelzoo/
-vjepa2-main/   # prefer documenting this as an external dependency
 ```
 
 ## External Dependencies
@@ -308,18 +307,25 @@ The code assumes the DrivoR/NAVSIM environment plus:
 - Hydra / OmegaConf
 - nuPlan / NAVSIM dependencies
 - Ray for metric-cache score computation
-- V-JEPA 2.1 source tree, referenced by:
-
-  ```text
-  config.image_backbone.vjepa2_repo_path
-  VJEPA2_1_REPO_PATH
-  ```
-
 - V-JEPA 2.1 checkpoint, referenced by:
 
   ```text
   config.image_backbone.model_weights
   ```
+
+This repository now includes the V-JEPA source code used by the DriveJEPA encoders:
+
+```text
+vjepa2-main/   # V-JEPA 2.1 source used by ImgEncoderVJEPA21
+vjepa2/        # legacy V-JEPA2 fallback used by ImgEncoderVJEPA2
+```
+
+When running on a new host, point the config or environment variable to the included source tree:
+
+```text
+config.image_backbone.vjepa2_repo_path = /path/to/RepDrive-code/vjepa2-main
+VJEPA2_1_REPO_PATH=/path/to/RepDrive-code/vjepa2-main
+```
 
 Paths in the local training scripts are machine-specific and should be edited before running on a new host.
 
@@ -354,4 +360,3 @@ Expected:
 ```text
 [1, 4, 16, 1024]
 ```
-
