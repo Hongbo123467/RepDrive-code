@@ -2,6 +2,14 @@
 
 DriveJEPA3 is a two-stage camera-only planning model built on the DrivoR/NAVSIM codebase. The first stage generates multi-modal trajectory proposals from multi-camera V-JEPA scene tokens. The second stage builds a BEV feature with LSS-style projection and learns residual corrections for the proposals.
 
+## CoBEVT Spatial-Token Cooperative Perception
+
+The `cobevt_spatial_token/` directory contains the related CoBEVT/OPV2V
+cooperative perception overlay that uses RepDrive/DriveJEPA-style V-JEPA spatial
+tokens for multi-CAV BEV segmentation. See
+`cobevt_spatial_token/README.md` for the copied file list, main entry points,
+and usage notes.
+
 The intended model behavior is:
 
 ```text

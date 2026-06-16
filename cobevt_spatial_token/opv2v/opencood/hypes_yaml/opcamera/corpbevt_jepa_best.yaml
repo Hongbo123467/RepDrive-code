@@ -1,0 +1,254 @@
+name: corpbevt_jepa_best
+
+root_dir: '/home/dataset-local/yinhongbo/datazoo/opv2v/train'
+validate_dir: '/home/dataset-local/yinhongbo/datazoo/opv2v/validate'
+
+
+train_params:
+  batch_size: &batch_size 2
+  epoches: &epoches 151
+  eval_freq: 5
+  save_freq: 5
+  max_cav: &max_cav 5
+  visible: true
+
+
+fusion:
+  core_method: 'CamIntermediateFusionDataset'
+  args:
+    queue_length: 2
+    timestamp_offset: 0
+    timestamp_offset_mean: 0
+    timestamp_offset_std: 0
+
+
+data_augment: []
+add_data_extension: ['bev_dynamic.png', 'bev_static.png', 'bev_lane.png', 'bev_visibility.png', 'bev_visibility_corp.png']
+
+
+preprocess:
+  core_method: 'RgbPreprocessor'
+  args:
+    bgr2rgb: true
+    resize_x: &image_width 512
+    resize_y: &image_height 512
+    mean: [0.485, 0.456, 0.406]
+    std: [0.229, 0.224, 0.225]
+  cav_lidar_range: &cav_lidar [-50, -50, -3, 50, 50, 1]
+
+
+postprocess:
+  core_method: 'CameraBevPostprocessor'
+  anchor_args:
+    cav_lidar_range: *cav_lidar
+  order: 'hwl'
+  max_num: 100
+  nms_thresh: 0.15
+
+
+model:
+  core_method: corpbevt_jepa
+  args:
+    target: &target 'both'
+    max_cav: *max_cav
+
+    # ------------------------------------------------------------
+    # Important for cooperative BEV segmentation:
+    # use current-frame spatial tokens for geometry projection.
+    # This avoids temporal-mixed features being projected with
+    # current-frame calibration.
+    # ------------------------------------------------------------
+    geometry_current_frame_only: false
+    debug_shapes: false
+
+    # ------------------------------------------------------------
+    # V-JEPA2.1 spatial-token encoder
+    # ------------------------------------------------------------
+    jepa_encoder:
+      vjepa_version: '2.1'
+      vjepa2_repo_path: '/home/dataset-local/yinhongbo/code/vjepa2-main'
+      vjepa2_config_path: '/home/dataset-local/yinhongbo/code/vjepa2-main/configs/eval_2_1/vitb-384/in1k.yaml'
+      model_weights: '/home/dataset-local/yinhongbo/modelzoo/V-JEPA/vjepa2_1_vitb_dist_vitG_384.pt'
+
+      image_architecture: 'vit_base'
+      vjepa2_resolution: [512, 512]
+      image_size: [512, 512]
+      img_as_video_nframes: 2
+
+      # LoRA setting.
+      # Start with rank 4 or 8. Rank 8 is a good default.
+      backbone_mode: 'lora'
+      lora_rank: 8
+      lora_alpha: 16
+      lora_dropout: 0.05
+      lora_target_modules: ['q_proj', 'v_proj']
+      lora_train_blocks: 'last_8'
+
+      # Scene-token settings are kept for compatibility.
+      # Cooperative branch mainly uses spatial tokens.
+      num_scene_tokens: 64
+      tf_d_model: 128
+
+      # Multiscale token extraction.
+      # forward_multiscale will output 4 maps:
+      # [N, M, fpn_feature_dim, 32, 32]
+      fpn_feature_dim: 256
+      fpn_layer_indices: [2, 5, 8, 11]
+      fpn_neck_norm: true
+      fpn_neck_act: true
+
+      # 512 / 16 = 32
+      spatial_hw: [32, 32]
+
+      # For BEV geometry tasks, keep this false first.
+      # Grid mask can be tested later as augmentation ablation.
+      use_grid_mask: false
+
+      input_is_normalized: true
+      prev_frame_index: 1
+
+      image_backbone:
+        lora_alpha: 16
+        lora_dropout: 0.05
+        lora_target_modules: ['q_proj', 'v_proj']
+        lora_train_blocks: 'last_8'
+
+
+    # ------------------------------------------------------------
+    # V-JEPA-friendly geometry pyramid adapter
+    # Input:
+    #   4 same-scale V-JEPA feature maps, each [B, 256, 32, 32]
+    # Output:
+    #   P3: [B, 128, 64, 64]
+    #   P4: [B, 256, 32, 32]
+    #   P5: [B, 512, 16, 16]
+    # ------------------------------------------------------------
+    vfm_fpn:
+      in_chs: [256, 256, 256, 256]
+      mid_ch: 256
+      out_channels: [128, 256, 512]
+      aspp_rates: [1, 2, 4]
+      cross_layer_residual: true
+      residual_init: 0.10
+
+
+    # ------------------------------------------------------------
+    # FAX module.
+    # This keeps the original single-agent FAX window setting.
+    # Only adaptation: use GN inside fax_modules_vjepa_best.py.
+    # ------------------------------------------------------------
+    fax:
+      dim: [128, 128, 128]
+      middle: [2, 2, 2]
+
+      # Used only by fax_modules_vjepa_best.py.
+      # If using original fax_modules.py, this field is ignored.
+      norm2d: 'gn'
+
+      # This will be overwritten in corpbevt_jepa_best.py according to
+      # V-JEPA pyramid output shapes.
+      backbone_output_shape: []
+
+      bev_embedding:
+        sigma: 1.0
+        bev_height: 256
+        bev_width: 256
+        h_meters: 100
+        w_meters: 100
+        offset: 0.0
+        upsample_scales: [2, 4, 8]
+
+      cross_view:
+        image_height: *image_height
+        image_width: *image_width
+        no_image_features: false
+        skip: true
+        heads: [4, 4, 4]
+        dim_head: [32, 32, 32]
+        qkv_bias: true
+
+      cross_view_swap:
+        rel_pos_emb: false
+
+        # Keep original single-agent FAX setting.
+        # Stage 0: BEV 128x128 <-> image feature 64x64
+        # Stage 1: BEV 64x64  <-> image feature 32x32
+        # Stage 2: BEV 32x32  <-> image feature 16x16
+        q_win_size: [[16, 16], [16, 16], [32, 32]]
+        feat_win_size: [[8, 8], [8, 8], [16, 16]]
+
+        # Keep original FAX design.
+        bev_embedding_flag: [true, false, false]
+
+      self_attn:
+        dim_head: 32
+        dropout: 0.1
+        window_size: 32
+
+
+    # ------------------------------------------------------------
+    # Optional BEV feature compression
+    # ------------------------------------------------------------
+    compression: 0
+
+
+    # ------------------------------------------------------------
+    # Cooperative spatial transformation
+    # ------------------------------------------------------------
+    sttf:
+      resolution: 0.390625
+      downsample_rate: 8
+      use_roi_mask: true
+
+
+    # ------------------------------------------------------------
+    # Cooperative BEV fusion
+    # ------------------------------------------------------------
+    fax_fusion:
+      input_dim: 128
+      mlp_dim: 256
+      agent_size: *max_cav
+      window_size: 8
+      dim_head: 32
+      drop_out: 0.1
+      depth: 3
+      mask: true
+
+
+    # ------------------------------------------------------------
+    # BEV decoder and segmentation head
+    # ------------------------------------------------------------
+    decoder:
+      input_dim: 128
+      num_layer: 3
+      num_ch_dec: &decoder_block [32, 64, 128]
+
+    seg_head_dim: 32
+    output_class: 2
+
+
+loss:
+  core_method: vanilla_seg_loss
+  args:
+    target: *target
+    d_weights: 75.0
+    s_weights: 2.0
+    l_weights: 4.0
+    d_coe: 2.0
+    s_coe: 1.0
+
+
+
+optimizer:
+  core_method: AdamW
+  lr: 3e-4
+  args:
+    eps: 1e-10
+    weight_decay: 1e-2
+
+lr_scheduler:
+    core_method: cosineannealwarm #step, multistep, Exponential and cosineannealwarm support
+    epoches: *epoches
+    warmup_lr: 2e-5
+    warmup_epoches: 10
+    lr_min: 5e-6
