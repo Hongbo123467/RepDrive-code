@@ -1,0 +1,190 @@
+_target_: navsim.agents.drivoR.drivejepa3_agent.DriveJEPA3Agent
+
+config:
+
+  b2d: false
+
+  shared_refiner: false
+  ref_num: 4
+  scorer_ref_num: 4
+
+  proposal_num: 64
+  num_poses: 8
+
+  num_scene_tokens: 16
+  one_token_per_traj: true
+  full_history_status: false
+
+  long_trajectory_additional_poses: -1
+
+  noc: 1.0
+  dac: 1.0
+  ddc: 0.0
+  ttc: 5.0
+  ep: 5.0
+  comfort: 2.0
+
+  tf_d_model: 256
+  tf_d_ffn: 1024
+  tf_dropout: 0.0
+  tf_num_head: 8
+  tf_num_layers: 3
+
+  ####################
+  # DriveJEPA3 LSS BEV + PAD-style decoder
+  traj_bev: true
+  traj_proposal_query: false
+  point_cloud_range: [-32, -32, -2.0, 32, 32, 6.0]
+  num_points_in_pillar: 4
+  half_length: 2.838
+  half_width: 1.2485
+  rear_axle_to_center: 1.461
+  lidar_height: 0.0
+  num_bev_layers: 1
+  IMAGE_FINAL_DIM: [256, 512]
+  MODEL_ENCODER_DOWNSAMPLE: 16
+  MODEL_ENCODER_OUT_CHANNELS: 64
+  LIFT_X_BOUND: [0.0, 32.0, 0.25]
+  LIFT_Y_BOUND: [-32.0, 32.0, 0.25]
+  LIFT_Z_BOUND: [-10.0, 10.0, 20.0]
+  LIFT_D_BOUND: [2.0, 50.0, 1.0]
+  bev_token_hw: [8, 16]
+  num_lss_cams: 4
+  bev_downscale_size: 8
+  decoder_ref_num: 2
+  decoder_residual_scale: 1.0
+  stage2_bridge:
+    freeze_image_backbone: true
+
+  ####################
+  # Sensors
+  cam_f0: [2,3]
+  cam_l0: [2,3]
+  cam_l1: []
+  cam_l2: []
+  cam_r0: [2,3]
+  cam_r1: []
+  cam_r2: []
+  cam_b0: [2,3]
+  lidar_pc: []
+
+  ####################
+  # V-JEPA2.1 image backbone
+  vjepa2_image_size: [512, 256]
+  image_size: [512, 256]
+
+  image_backbone:
+    vjepa_version: "2.1"
+    vjepa2_repo_path: /home/dataset-assist-0/yinhongbo/code/robotics/vjepa2-main
+    vjepa2_config_path: /home/dataset-assist-0/yinhongbo/code/robotics/vjepa2-main/configs/eval_2_1/vitl-384/in1k.yaml
+    model_weights: /home/dataset-assist-0/yinhongbo/modelzoo/V-JEPA/vjepa2_1_vitl_dist_vitG_384.pt
+    checkpoint_key: ema_encoder
+    image_architecture: vit_large
+    img_as_video_nframes: 2
+    vjepa2_resolution: [256, 512]
+    vjepa2_n_tokens: 512
+    fpn_layer_indices: [5, 11, 17, 23]
+    spatial_hw: [16, 32]
+
+    backbone_mode: "scene_lora"
+    lora_rank: 32
+    use_rope: true
+    img_temporal_dim_size: 1
+    interpolate_rope: true
+    modality_embedding: true
+    use_activation_checkpointing: false
+    use_grid_mask: true
+    focus_front_cam: false
+    use_feature_pooling: false
+    compress_fc: false
+
+  ####################
+  # LiDAR branch placeholders
+  lidar_min_x: -32
+  lidar_max_x: 32
+  lidar_min_y: -32
+  lidar_max_y: 32
+  lidar_image_size: [518, 518]
+  lidar_hist_max_per_pixel: 5
+  lidar_max_height: 100.0
+  lidar_split_height: 0.2
+  lidar_use_ground_plane: true
+  lidar_backbone:
+    model_name: timm/vit_small_patch14_reg4_dinov2.lvd142m
+    model_weights: weights/vit_small_patch14_reg4_dinov2.lvd142m/model.safetensors
+    use_lora: true
+    finetune: false
+    lora_rank: 32
+    in_chans: 2
+
+  ####################
+  # Scorer and decoder supervision
+  double_score: false
+  agent_pred: false
+  area_pred: false
+  bev_map: false
+  bev_agent: false
+  num_bounding_boxes: 30
+  num_bev_classes: 7
+  bev_pixel_width: 256
+  bev_pixel_height: 128
+  bev_pixel_size: 0.25
+  bev_semantic_frame: [128, 256]
+  bev_radius: 32
+  bev_features_channels: 64
+  lidar_resolution_width: 256
+  lidar_resolution_height: 256
+  bev_semantic_classes:
+    1:
+      entity_type: polygon
+      layers: [LANE, INTERSECTION]
+    2:
+      entity_type: polygon
+      layers: [WALKWAYS]
+    3:
+      entity_type: linestring
+      layers: [LANE, LANE_CONNECTOR]
+    4:
+      entity_type: box
+      layers: [CZONE_SIGN, BARRIER, TRAFFIC_CONE, GENERIC_OBJECT]
+    5:
+      entity_type: box
+      layers: [VEHICLE]
+    6:
+      entity_type: box
+      layers: [PEDESTRIAN]
+  refiner_num_heads: 1
+  refiner_ls_values: 0.0
+
+  trajectory_sampling:
+    _target_: nuplan.planning.simulation.trajectory.trajectory_sampling.TrajectorySampling
+    time_horizon: 4
+    interval_length: 0.5
+
+loss:
+  _target_: navsim.agents.drivoR.layers.losses.drivejepa3_loss.DriveJEPA3Loss
+  trajectory_weight: 1.0
+  inter_weight: 0.0
+  sub_score_weight: 0.0
+  final_score_weight: 1.0
+  pred_ce_weight: 1.0
+  pred_l1_weight: 0.1
+  pred_area_weight: 2.0
+  prev_weight: 0.0
+  agent_class_weight: 1.0
+  agent_box_weight: 0.1
+  bev_semantic_weight: 1.0
+  div_weight: 0.0
+
+checkpoint_path: ''
+lr_args:
+  name: AdamW
+  base_lr: 5e-4
+  base_batch_size: 64
+scheduler_args:
+  num_epochs: ${trainer.params.max_epochs}
+  dataset_size: 85000
+
+batch_size: ${dataloader.params.batch_size}
+num_gpus: 1
+progress_bar: true
