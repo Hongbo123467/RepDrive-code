@@ -6,7 +6,10 @@ DriveJEPA3 is a two-stage camera-only planning model built on the DrivoR/NAVSIM 
 
 The `cobevt_spatial_token/` directory contains the related CoBEVT/OPV2V
 cooperative perception overlay that uses RepDrive/DriveJEPA-style V-JEPA spatial
-tokens for multi-CAV BEV segmentation. See
+tokens for multi-CAV BEV segmentation. The final selected cooperative
+configuration is **V-JEPA + CVT + swap_fusion**, implemented by
+`cobevt_spatial_token/opv2v/opencood/hypes_yaml/opcamera/vjepa_cvt_fuse_from_single50.yaml`.
+See
 `cobevt_spatial_token/README.md` for the copied file list, main entry points,
 and usage notes.
 
