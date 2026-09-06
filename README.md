@@ -1,5 +1,9 @@
 # DriveJEPA3
 
+## Current architecture and agent handoff
+
+Read [NETWORK_ARCHITECTURE.md](md/NETWORK_ARCHITECTURE.md) for the current V8 implementation, tensor shapes, training boundaries, checkpoint compatibility, and maintenance instructions. The overview below describes the earlier design; the active decoder now performs whole-trajectory Scene → BEV → Agent refinement, and V8 freezes the existing feature paths while training the new refiner and original scorer.
+
 DriveJEPA3 is a two-stage camera-only planning model built on the DrivoR/NAVSIM codebase. The first stage generates multi-modal trajectory proposals from multi-camera V-JEPA scene tokens. The second stage builds a BEV feature with LSS-style projection and learns residual corrections for the proposals.
 
 The intended model behavior is:
