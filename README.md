@@ -313,7 +313,7 @@ The code assumes the DrivoR/NAVSIM environment plus:
   config.image_backbone.model_weights
   ```
 
-This repository now includes the V-JEPA source code used by the DriveJEPA encoders:
+The GitHub release repository now includes the V-JEPA source code used by the DriveJEPA encoders:
 
 ```text
 vjepa2-main/   # V-JEPA 2.1 source used by ImgEncoderVJEPA21

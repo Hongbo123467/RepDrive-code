@@ -1,5 +1,6 @@
 from pathlib import Path
 from typing import Any, Dict
+import logging
 import math
 import os
 
@@ -7,7 +8,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from omegaconf import OmegaConf
-from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
+from pytorch_lightning.callbacks import Callback, LearningRateMonitor, ModelCheckpoint
 
 from navsim.agents.abstract_agent import AbstractAgent
 from navsim.common.dataloader import MetricCacheLoader
@@ -18,8 +19,61 @@ from .drivejepa3_model import DriveJEPA3Model
 from .drivor_features import DrivoRTargetBuilder
 
 
+logger = logging.getLogger(__name__)
+
+
+class DriveJEPA3ScorerGradientAudit(Callback):
+    """Fail the run if AMP or a detach boundary disconnects the scorer."""
+
+    def __init__(self):
+        super().__init__()
+        self._completed = False
+
+    def on_after_backward(self, trainer, pl_module) -> None:
+        if self._completed:
+            return
+
+        model = pl_module.agent._drivor_model
+        modules = {
+            "pos_embed": model.pos_embed,
+            "scorer_attention": model.scorer_attention,
+            "scorer": model.scorer,
+        }
+        summaries = []
+        disconnected = []
+        for module_name, module in modules.items():
+            trainable = [
+                (name, parameter)
+                for name, parameter in module.named_parameters()
+                if parameter.requires_grad
+            ]
+            connected = [
+                (name, parameter)
+                for name, parameter in trainable
+                if parameter.grad is not None
+            ]
+            summaries.append(f"{module_name}={len(connected)}/{len(trainable)}")
+            disconnected.extend(
+                f"{module_name}.{name}"
+                for name, parameter in trainable
+                if parameter.grad is None
+            )
+
+        if disconnected:
+            raise RuntimeError(
+                "DriveJEPA3 scorer gradient audit failed; disconnected parameters: "
+                + ", ".join(disconnected)
+            )
+
+        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+            logger.info("Scorer gradient audit passed: %s", ", ".join(summaries))
+        self._completed = True
+
+
 class DriveJEPA3Agent(AbstractAgent):
     """DriveJEPA3 Agent with post-scorer PAD/VeteranAD-style decoder."""
+
+    model_cls = DriveJEPA3Model
 
     def __init__(
         self,
@@ -45,7 +99,7 @@ class DriveJEPA3Agent(AbstractAgent):
         self.ray = True
         self._score_resources_ready = False
 
-        self._drivor_model = DriveJEPA3Model(config)
+        self._drivor_model = self.model_cls(config)
 
     def _ensure_score_resources(self):
         if self._score_resources_ready:
@@ -55,7 +109,21 @@ class DriveJEPA3Agent(AbstractAgent):
             from navsim.planning.utils.multithreading.worker_ray_no_torch import RayDistributedNoTorch
             from nuplan.planning.utils.multithreading.worker_utils import worker_map
 
-            self.worker = RayDistributedNoTorch(threads_per_node=8)
+            score_threads_per_rank = int(
+                self._config.get("score_threads_per_rank", 8)
+            )
+            if score_threads_per_rank < 1:
+                raise ValueError(
+                    "score_threads_per_rank must be positive, "
+                    f"got {score_threads_per_rank}"
+                )
+            logger.info(
+                "Initializing PDM scoring with %d Ray workers per DDP rank",
+                score_threads_per_rank,
+            )
+            self.worker = RayDistributedNoTorch(
+                threads_per_node=score_threads_per_rank
+            )
             self.worker_map = worker_map
 
         from .score_module.compute_navsim_score import get_scores
@@ -107,8 +175,32 @@ class DriveJEPA3Agent(AbstractAgent):
             new_state_dict = {}
             for key, value in state_dict.items():
                 key = key.replace("agent._drivor_model", "_drivor_model")
+                key = key.replace(
+                    "_drivor_model.bev_agent_decoder.",
+                    "_drivor_model.post_scorer_decoder.",
+                )
                 new_state_dict[key] = value
-            self.load_state_dict(new_state_dict, strict=False)
+            incompatible = self.load_state_dict(new_state_dict, strict=False)
+            allowed_missing_prefixes = (
+                "_drivor_model.post_scorer_decoder.trajectory_query.",
+                "_drivor_model.post_scorer_decoder.proposal_refiner.",
+                "_drivor_model.interaction_residual_scorer.",
+            )
+            invalid_missing = [
+                key
+                for key in incompatible.missing_keys
+                if not key.startswith(allowed_missing_prefixes)
+            ]
+            if incompatible.unexpected_keys or invalid_missing:
+                raise RuntimeError(
+                    "Stage1 checkpoint is incompatible with DriveJEPA3: "
+                    f"unexpected={incompatible.unexpected_keys}, "
+                    f"invalid_missing={invalid_missing}"
+                )
+            logger.info(
+                "Loaded Stage1 checkpoint; %d new Stage3 parameters initialized from scratch",
+                len(incompatible.missing_keys),
+            )
 
     def get_sensor_config(self) -> SensorConfig:
         return SensorConfig(
@@ -180,12 +272,51 @@ class DriveJEPA3Agent(AbstractAgent):
 
     def get_optimizers(self):
         global_batchsize = self.batch_size * self.num_gpus
+        lr = self._lr_args["base_lr"] * math.sqrt(
+            global_batchsize / self._lr_args["base_batch_size"]
+        )
+        stage2_bridge_config = self._config.get("stage2_bridge", {})
+        scorer_lr_multiplier = float(
+            stage2_bridge_config.get("scorer_lr_multiplier", 1.0)
+        )
+        scorer_weight_decay = float(
+            stage2_bridge_config.get("scorer_weight_decay", 0.0)
+        )
+        scorer_prefixes = ("scorer_attention.", "pos_embed.", "scorer.")
+        scorer_parameters = []
+        stage2_parameters = []
+        for name, parameter in self._drivor_model.named_parameters():
+            if not parameter.requires_grad:
+                continue
+            if name.startswith(scorer_prefixes):
+                scorer_parameters.append(parameter)
+            else:
+                stage2_parameters.append(parameter)
+
+        parameter_groups = []
+        if stage2_parameters:
+            parameter_groups.append({"params": stage2_parameters, "lr": lr})
+        if scorer_parameters:
+            parameter_groups.append(
+                {
+                    "params": scorer_parameters,
+                    "lr": lr * scorer_lr_multiplier,
+                    "weight_decay": scorer_weight_decay,
+                }
+            )
+        if not parameter_groups:
+            raise RuntimeError("DriveJEPA3 has no trainable parameters")
+        logger.info(
+            "Optimizer groups: stage2=%d params at %.3e, scorer=%d params at %.3e",
+            sum(parameter.numel() for parameter in stage2_parameters),
+            lr,
+            sum(parameter.numel() for parameter in scorer_parameters),
+            lr * scorer_lr_multiplier,
+        )
         if self._lr_args["name"] == "Adam":
-            lr = self._lr_args["base_lr"] * math.sqrt(global_batchsize / self._lr_args["base_batch_size"])
-            optimizer = torch.optim.Adam(self._drivor_model.parameters(), lr=lr)
+            optimizer = torch.optim.Adam(parameter_groups, lr=lr)
         elif self._lr_args["name"] == "AdamW":
-            lr = self._lr_args["base_lr"] * math.sqrt(global_batchsize / self._lr_args["base_batch_size"])
-            optimizer = torch.optim.AdamW(self._drivor_model.parameters(), lr=lr)
+            optimizer = torch.optim.AdamW(parameter_groups, lr=lr)
         else:
             raise NotImplementedError(f"Unsupported optimizer: {self._lr_args['name']}")
 
@@ -221,8 +352,28 @@ class DriveJEPA3Agent(AbstractAgent):
             save_on_train_epoch_end=False,
         )
         checkpoint_cb = ModelCheckpoint(save_last=True)
+        checkpoint_cb_periodic = ModelCheckpoint(
+            every_n_epochs=5,
+            save_top_k=-1,
+            filename="epoch-{epoch:02d}-{step}",
+            save_on_train_epoch_end=True,
+        )
         lr_monitor = LearningRateMonitor(logging_interval="step", log_momentum=False, log_weight_decay=False)
+        gradient_audit = DriveJEPA3ScorerGradientAudit()
         if self.progress_bar:
-            return [checkpoint_cb_best, checkpoint_cb, lr_monitor]
+            return [
+                checkpoint_cb_best,
+                checkpoint_cb,
+                checkpoint_cb_periodic,
+                lr_monitor,
+                gradient_audit,
+            ]
         progress_bar = LitProgressBar()
-        return [checkpoint_cb_best, checkpoint_cb, progress_bar, lr_monitor]
+        return [
+            checkpoint_cb_best,
+            checkpoint_cb,
+            checkpoint_cb_periodic,
+            progress_bar,
+            lr_monitor,
+            gradient_audit,
+        ]

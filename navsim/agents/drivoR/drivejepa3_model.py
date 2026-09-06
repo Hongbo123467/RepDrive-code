@@ -6,7 +6,10 @@ from torchvision import transforms
 
 from .drivejepa2_bevformer.fpn_adapter import DriveJEPA2FPNAdapter
 from .drivejepa2_bevformer.lss_bev import DriveJEPA2LSSProjector
-from .drivejepa3_decoder import DriveJEPA3Decoder
+from .drivejepa3_decoder import (
+    DriveJEPA3Decoder,
+    DriveJEPA3PlanningAwareDecoder,
+)
 from .layers.image_encoder.vjepa2_1_lora import ImgEncoderVJEPA21
 from .layers.image_encoder.vjepa2_lora import ImgEncoderVJEPA2
 from .layers.utils.mlp import MLP
@@ -22,8 +25,42 @@ def _cfg_get(config, key, default=None):
     return config.get(key, default) if hasattr(config, "get") else getattr(config, key, default)
 
 
+class InteractionResidualScorer(nn.Module):
+    """Bounded logit correction from the final planning-interaction query."""
+
+    score_names = (
+        "no_at_fault_collisions",
+        "drivable_area_compliance",
+        "time_to_collision_within_bound",
+        "ego_progress",
+        "driving_direction_compliance",
+        "comfort",
+    )
+
+    def __init__(self, d_model: int, hidden_dim: int, scale: float):
+        super().__init__()
+        self.scale = float(scale)
+        self.net = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, len(self.score_names)),
+        )
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, query: torch.Tensor) -> torch.Tensor:
+        return self.scale * torch.tanh(self.net(query))
+
+
 class DriveJEPA3Model(nn.Module):
     """DriveJEPA2 backbone with PAD/VeteranAD-style post-scorer decoder."""
+
+    # Decoder version history:
+    # V1 (legacy): waypoint-level GRU autoregression. Kept for reproduction.
+    # decoder_cls = DriveJEPA3Decoder
+    # V2 (active): complete-trajectory hierarchical Scene -> BEV -> Agent refinement.
+    decoder_cls = DriveJEPA3PlanningAwareDecoder
 
     def __init__(self, config):
         super().__init__()
@@ -32,9 +69,26 @@ class DriveJEPA3Model(nn.Module):
         self.state_size = 3
         self.embed_dims = self._config.tf_d_model
         stage2_bridge_config = _cfg_get(config, "stage2_bridge", {})
+        self.freeze_stage1 = bool(_cfg_get(stage2_bridge_config, "freeze_stage1", True))
+        self.freeze_stage1_except_scorer = bool(
+            _cfg_get(stage2_bridge_config, "freeze_stage1_except_scorer", False)
+            and not self.freeze_stage1
+        )
+        self.freeze_proposal_generator = bool(
+            _cfg_get(stage2_bridge_config, "freeze_proposal_generator", False)
+            or self.freeze_stage1_except_scorer
+            or self.freeze_stage1
+        )
+        self.detach_initial_query = bool(
+            _cfg_get(stage2_bridge_config, "detach_initial_query", False)
+            or self.freeze_stage1_except_scorer
+            or self.freeze_stage1
+        )
         self.freeze_image_backbone = bool(
             _cfg_get(stage2_bridge_config, "freeze_image_backbone", False)
             or _cfg_get(stage2_bridge_config, "freeze_backbone", False)
+            or self.freeze_stage1_except_scorer
+            or self.freeze_stage1
         )
 
         self.num_cams = 0
@@ -87,7 +141,7 @@ class DriveJEPA3Model(nn.Module):
                 in_channels=config.tf_d_model,
                 out_channels=getattr(config, "MODEL_ENCODER_OUT_CHANNELS", 64),
             )
-            self.post_scorer_decoder = DriveJEPA3Decoder(
+            self.post_scorer_decoder = self.decoder_cls(
                 config=config,
                 in_channels=getattr(config, "MODEL_ENCODER_OUT_CHANNELS", 64),
             )
@@ -148,7 +202,96 @@ class DriveJEPA3Model(nn.Module):
             [MLP(config.tf_d_model, config.tf_d_ffn, traj_head_output_size) for _ in range(config.ref_num + 1)]
         )
         self.scorer = Scorer(config)
+        self.interaction_residual_scorer = InteractionResidualScorer(
+            d_model=config.tf_d_model,
+            hidden_dim=int(_cfg_get(config, "interaction_scorer_hidden_dim", config.tf_d_model)),
+            scale=float(_cfg_get(config, "interaction_score_residual_scale", 0.0)),
+        )
         self.b2d = config.b2d
+
+        self._proposal_generator_modules = [
+            self.hist_encoding,
+            self.init_feature,
+            self.trajectory_decoder,
+            self.traj_head,
+        ]
+        self._scorer_modules = [
+            self.scorer_attention,
+            self.pos_embed,
+            self.scorer,
+        ]
+        self._stage1_modules = [
+            self.image_backbone,
+            self.image_fpn,
+            self.lss_bev_projector,
+            self.hist_encoding,
+            self.init_feature,
+            self.trajectory_decoder,
+            self.scorer_attention,
+            self.pos_embed,
+            self.traj_head,
+            self.scorer,
+            self.post_scorer_decoder.segmentation_head,
+            self.post_scorer_decoder.bev_downscale,
+            self.post_scorer_decoder.keyval_embedding,
+            self.post_scorer_decoder.status_encoding,
+            self.post_scorer_decoder.trajectory_query,
+            self.post_scorer_decoder.query_embedding,
+            self.post_scorer_decoder.tf_decoder,
+            self.post_scorer_decoder.agent_head,
+        ]
+        if self.num_lidar > 0:
+            self._stage1_modules.append(self.lidar_backbone)
+        if self.freeze_stage1:
+            for module in self._stage1_modules:
+                module.requires_grad_(False)
+            if self.scene_embeds is not None:
+                self.scene_embeds.requires_grad_(False)
+            if self.num_lidar > 0:
+                self.lidar_scene_embeds.requires_grad_(False)
+        elif self.freeze_stage1_except_scorer:
+            for module in self._stage1_modules:
+                module.requires_grad_(False)
+            for module in self._scorer_modules:
+                module.requires_grad_(True)
+            if self.scene_embeds is not None:
+                self.scene_embeds.requires_grad_(False)
+            if self.num_lidar > 0:
+                self.lidar_scene_embeds.requires_grad_(False)
+        elif self.freeze_proposal_generator:
+            for module in self._proposal_generator_modules:
+                module.requires_grad_(False)
+
+        self.scorer_trainable = any(
+            parameter.requires_grad
+            for module in self._scorer_modules
+            for parameter in module.parameters()
+        )
+
+        log.info(
+            "Stage2 bridge: freeze_stage1=%s, freeze_stage1_except_scorer=%s, freeze_image_backbone=%s, "
+            "freeze_proposal_generator=%s, detach_initial_query=%s",
+            self.freeze_stage1,
+            self.freeze_stage1_except_scorer,
+            self.freeze_image_backbone,
+            self.freeze_proposal_generator,
+            self.detach_initial_query,
+        )
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.freeze_stage1 or self.freeze_stage1_except_scorer:
+            for module in self._stage1_modules:
+                module.eval()
+            if self.freeze_stage1_except_scorer:
+                for module in self._scorer_modules:
+                    module.train(mode)
+        elif self.freeze_proposal_generator:
+            for module in self._proposal_generator_modules:
+                module.eval()
+        if self.freeze_image_backbone:
+            self.image_backbone.eval()
+        return self
 
     @staticmethod
     def _status_feature_from_ego(ego_status: torch.Tensor) -> torch.Tensor:
@@ -161,6 +304,22 @@ class DriveJEPA3Model(nn.Module):
             dim=-1,
         )
 
+    def _encode_trajectory_query(
+        self,
+        proposals: torch.Tensor,
+        scene_features: torch.Tensor,
+        ego_token: torch.Tensor,
+        detach_output: bool,
+    ) -> torch.Tensor:
+        """Encode trajectory coordinates without poisoning AMP's weight cache."""
+        batch, num_proposals = proposals.shape[:2]
+        embedded_traj = self.pos_embed(
+            proposals.reshape(batch, num_proposals, -1).detach()
+        )
+        trajectory_query = self.scorer_attention(embedded_traj, scene_features)
+        trajectory_query = trajectory_query + ego_token
+        return trajectory_query.detach() if detach_output else trajectory_query
+
     def forward(self, features: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         if self._config.full_history_status:
             ego_status = features["ego_status"].flatten(-2)
@@ -169,8 +328,13 @@ class DriveJEPA3Model(nn.Module):
             ego_status = features["ego_status"][:, -1]
             ego_status_current = ego_status
 
-        ego_token = self.hist_encoding(ego_status)[:, None]
-        traj_tokens = ego_token + self.init_feature.weight[None]
+        if self.freeze_proposal_generator:
+            with torch.no_grad():
+                ego_token = self.hist_encoding(ego_status)[:, None]
+                traj_tokens = ego_token + self.init_feature.weight[None]
+        else:
+            ego_token = self.hist_encoding(ego_status)[:, None]
+            traj_tokens = ego_token + self.init_feature.weight[None]
 
         batch_size = ego_status.shape[0]
         scene_features = []
@@ -261,18 +425,21 @@ class DriveJEPA3Model(nn.Module):
 
         scene_features = torch.cat(scene_features, dim=1)
 
-        proposals = self.traj_head[0](traj_tokens).reshape(
-            traj_tokens.shape[0], -1, self.poses_num, self.state_size
-        )
-        proposal_list = [proposals]
-
-        token_list = self.trajectory_decoder(traj_tokens, scene_features)
-        for i in range(self._config.ref_num):
-            tokens = token_list[i]
-            proposals = self.traj_head[i + 1](tokens).reshape(
-                tokens.shape[0], -1, self.poses_num, self.state_size
+        with torch.set_grad_enabled(
+            torch.is_grad_enabled() and not self.freeze_proposal_generator
+        ):
+            proposals = self.traj_head[0](traj_tokens).reshape(
+                traj_tokens.shape[0], -1, self.poses_num, self.state_size
             )
-            proposal_list.append(proposals)
+            proposal_list = [proposals]
+
+            token_list = self.trajectory_decoder(traj_tokens, scene_features)
+            for i in range(self._config.ref_num):
+                tokens = token_list[i]
+                proposals = self.traj_head[i + 1](tokens).reshape(
+                    tokens.shape[0], -1, self.poses_num, self.state_size
+                )
+                proposal_list.append(proposals)
 
         raw_proposals = proposal_list[-1]
 
@@ -282,13 +449,27 @@ class DriveJEPA3Model(nn.Module):
         }
 
         batch, num_proposals, _, _ = raw_proposals.shape
-        embedded_traj = self.pos_embed(raw_proposals.reshape(batch, num_proposals, -1).detach())
-        tr_out = self.scorer_attention(embedded_traj, scene_features)
-        tr_out = tr_out + ego_token
+        # Keep this call grad-enabled and detach only its output. Under mixed
+        # precision, invoking these shared modules under no_grad first causes
+        # autocast to cache detached FP16 weights that are then reused by the
+        # trainable final scorer call in the same forward pass.
+        tr_out = self._encode_trajectory_query(
+            proposals=raw_proposals,
+            scene_features=scene_features,
+            ego_token=ego_token,
+            detach_output=self.detach_initial_query,
+        )
+
+        refiner_proposals = (
+            raw_proposals.detach()
+            if self.freeze_proposal_generator
+            else raw_proposals
+        )
 
         if bev_feature is None:
-            refined_proposals = raw_proposals
+            refined_proposals = refiner_proposals
             refined_proposal_list = [refined_proposals]
+            refiner_query_state = tr_out
             bev_semantic_map = None
             agent_states = None
             agent_labels = None
@@ -296,12 +477,15 @@ class DriveJEPA3Model(nn.Module):
             decoder_output = self.post_scorer_decoder(
                 bev_feature=bev_feature,
                 status_feature=self._status_feature_from_ego(ego_status_current),
-                proposals=raw_proposals,
+                proposals=refiner_proposals,
                 traj_feature_bev=tr_out,
+                scene_features=scene_features,
             )
             output["poses_reg_list"] = decoder_output["poses_reg_list"]
             refined_proposals = decoder_output["poses_reg_list"][-1]
             refined_proposal_list = list(decoder_output["poses_reg_list"])
+            refiner_query_state = decoder_output["refiner_query_list"][-1]
+            output["refiner_query_list"] = decoder_output["refiner_query_list"]
             bev_semantic_map = decoder_output["bev_semantic_map"]
             agent_states = decoder_output["agent_states"]
             agent_labels = decoder_output["agent_labels"]
@@ -310,24 +494,45 @@ class DriveJEPA3Model(nn.Module):
         output["proposals"] = refined_proposals
         output["proposal_list"] = refined_proposal_list
 
-        embedded_refined_traj = self.pos_embed(refined_proposals.reshape(batch, num_proposals, -1).detach())
-        refined_tr_out = self.scorer_attention(embedded_refined_traj, scene_features)
-        refined_tr_out = refined_tr_out + ego_token
+        with torch.set_grad_enabled(torch.is_grad_enabled() and self.scorer_trainable):
+            refined_tr_out = self._encode_trajectory_query(
+                proposals=refined_proposals,
+                scene_features=scene_features,
+                ego_token=ego_token,
+                detach_output=False,
+            )
 
-        (
-            pred_logit,
-            pred_logit2,
-            pred_agents_states,
-            pred_area_logit,
-            scorer_bev_semantic_map,
-            scorer_agent_states,
-            scorer_agent_labels,
-        ) = self.scorer(refined_proposals, refined_tr_out)
+            (
+                pred_logit,
+                pred_logit2,
+                pred_agents_states,
+                pred_area_logit,
+                scorer_bev_semantic_map,
+                scorer_agent_states,
+                scorer_agent_labels,
+            ) = self.scorer(refined_proposals, refined_tr_out)
+
+            # V8 scorer-alignment ablation (2026-08-02): match the legacy
+            # coordinate scorer path exactly. Keep the module in the model so
+            # V7 checkpoints remain load-compatible, but do not use its query
+            # residual to alter any of the six PDM logits.
+            # interaction_score_residual = self.interaction_residual_scorer(
+            #     refiner_query_state.detach()
+            # )
+            # for score_idx, score_name in enumerate(
+            #     self.interaction_residual_scorer.score_names
+            # ):
+            #     pred_logit[score_name] = (
+            #         pred_logit[score_name]
+            #         + interaction_score_residual[..., score_idx]
+            #     )
+            interaction_score_residual = None
 
         output["pred_logit"] = pred_logit
         output["pred_logit2"] = pred_logit2
         output["pred_agents_states"] = pred_agents_states
         output["pred_area_logit"] = pred_area_logit
+        output["interaction_score_residual"] = interaction_score_residual
         output["bev_semantic_map"] = bev_semantic_map if bev_feature is not None else scorer_bev_semantic_map
         output["agent_states"] = agent_states if bev_feature is not None else scorer_agent_states
         output["agent_labels"] = agent_labels if bev_feature is not None else scorer_agent_labels

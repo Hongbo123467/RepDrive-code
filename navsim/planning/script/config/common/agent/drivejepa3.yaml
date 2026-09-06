@@ -53,8 +53,41 @@ config:
   bev_downscale_size: 8
   decoder_ref_num: 2
   decoder_residual_scale: 1.0
+  # V3 stabilization: preserve the Stage1 trajectory exactly at startup.
+  decoder_residual_init_std: 0.0
+  # VeteranAD-style rounds carry detached geometry but rebuild the query from
+  # the original Stage1 trajectory feature at every round.
+  decoder_detach_between_rounds: true
+  decoder_reset_query_each_round: true
+  # Compatibility fallback used only when query reset is disabled.
+  decoder_detach_query_between_rounds: true
+  decoder_intermediate_loss_weight: 0.1
+  # Match VeteranAD's decoder placement: deterministic attention/FFN, with
+  # dropout only on the BEV residual output branch.
+  decoder_attention_dropout: 0.0
+  decoder_scene_residual_dropout: 0.0
+  decoder_bev_residual_dropout: 0.1
+  decoder_agent_residual_dropout: 0.0
+  decoder_ffn_dropout: 0.0
+  decoder_dropout: 0.0
+  # V8 scorer alignment: retain the residual module only for V7 checkpoint
+  # compatibility; the forward path no longer applies it to scorer logits.
+  interaction_scorer_hidden_dim: 256
+  interaction_score_residual_scale: 0.0
+  # Four DDP ranks x 16 workers matches the old eight-rank x eight-worker
+  # PDM-target generation parallelism without changing optimization semantics.
+  score_threads_per_rank: 16
   stage2_bridge:
+    # V8 Stage2 boundary: keep every pretrained Stage1 feature path fixed except
+    # the scorer. Both the scorer and the new refiner use the old effective LR;
+    # the initial-query output remains detached and the residual scorer is off.
+    freeze_stage1: false
+    freeze_stage1_except_scorer: true
     freeze_image_backbone: true
+    freeze_proposal_generator: true
+    detach_initial_query: true
+    scorer_lr_multiplier: 1.0
+    scorer_weight_decay: 0.0
 
   ####################
   # Sensors
@@ -183,7 +216,7 @@ lr_args:
   base_batch_size: 64
 scheduler_args:
   num_epochs: ${trainer.params.max_epochs}
-  dataset_size: 85000
+  dataset_size: 103288
 
 batch_size: ${dataloader.params.batch_size}
 num_gpus: 1
